@@ -6,15 +6,17 @@ import threading
 import os
 import logging
 import string
+import urllib.request
+import urllib.parse
+import asyncio
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import paho.mqtt.client as mqtt
-import websocket  # <-- Library for WebSockets (CC1)
+import websocket as ws_client_lib
 
 # --- LOGGING CONFIGURATION ---
-# Log format: [Time] [Level] [Filename:Line] Message
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(filename)s:%(lineno)d] %(message)s",
@@ -22,10 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ElegooHub")
 
-# --- CONFIG FILE NAME ---
-CONFIG_FILE = "config.json"
-
-# --- GLOBAL CONFIGURATION (In-Memory Only, No Config File on Disk) ---
+# --- GLOBAL CONFIGURATION (In-Memory Only) ---
 PRINTER_IP = ""      
 PRINTER_SN = ""      
 PRINTER_PROTO = ""   # Will be dynamically set to "cc1" (WebSocket) or "cc2" (MQTT)
@@ -50,33 +49,6 @@ register_request_id = f"{client_id}_req"
 mqtt_client = None
 ws_client = None
 ws_client_conn = None  # Holds the active websocket connection instance for CC1
-
-# --- CORE CONFIGURATION FILE FUNCTIONS ---
-def load_config():
-    global PRINTER_IP, PRINTER_SN, PRINTER_PROTO
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                PRINTER_IP = data.get("ip", "")
-                PRINTER_SN = data.get("sn", "")
-                PRINTER_PROTO = data.get("proto", "")
-                logger.info(f"[Config] Configuration loaded: IP={PRINTER_IP} | SN={PRINTER_SN} | Protocol={PRINTER_PROTO}")
-        except Exception as e:
-            logger.error(f"[Config] Error loading config: {e}", exc_info=True)
-
-def save_config(ip, sn, proto):
-    try:
-        config_data = {
-            "ip": ip,
-            "sn": sn,
-            "proto": proto
-        }
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config_data, f, indent=4, ensure_ascii=False)
-        logger.info(f"[Config] Saved: IP={ip} | SN={sn} | Protocol={proto}")
-    except Exception as e:
-        logger.error(f"[Config] Error saving config: {e}", exc_info=True)
 
 # --- 1. AUTOMATIC PRINTER DISCOVERY (UDP Multiscanning) ---
 def discover_multiple_printers(timeout_sec=2.0):
@@ -266,7 +238,7 @@ def start_ws_cc1_thread():
     url = f"ws://{PRINTER_IP}:3030/websocket"
     logger.info(f"[WS CC1] Connecting to CC1 WebSocket server at {url}...")
     
-    ws_client = websocket.WebSocketApp(
+    ws_client = ws_client_lib.WebSocketApp(
         url,
         on_open=on_ws_open,
         on_message=on_ws_message,
@@ -339,11 +311,6 @@ def heartbeat_loop():
 
 # --- 4. WEB SERVER (FastAPI) ---
 app = FastAPI()
-
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    logger.debug(f"[HTTP] {request.method} {request.url.path}")
-    return await call_next(request)
 
 # --- MAIN WEB HUB (Landing Page) ---
 @app.get("/", response_class=HTMLResponse)
@@ -797,11 +764,163 @@ async def handle_command(cmd: str):
             
     return {"success": True}
 
-# --- SPA ROUTING WITH "BACK TO HUB" BUTTON INJECTION ---
+# --- WEBCAM STREAM PROXY ENDPOINT ---
+@app.get("/webcam")
+async def webcam_proxy():
+    if not PRINTER_IP:
+        raise HTTPException(status_code=400, detail="No printer selected/connected")
+    
+    webcam_url = f"http://{PRINTER_IP}:8080/?action=stream"
+    
+    try:
+        req = urllib.request.Request(webcam_url)
+        response = urllib.request.urlopen(req, timeout=5)
+        
+        content_type = response.headers.get(
+            "Content-Type", 
+            "multipart/x-mixed-replace; boundary=boundarydonotcross"
+        )
+        
+        def stream_chunks():
+            try:
+                while True:
+                    chunk = response.read(4096)
+                    if not chunk:
+                        break
+                    yield chunk
+            except Exception as e:
+                logger.debug(f"[Webcam] Stream disconnected or closed: {e}")
+            finally:
+                response.close()
+                
+        return StreamingResponse(stream_chunks(), media_type=content_type)
+        
+    except Exception as e:
+        logger.error(f"[Webcam] Failed to connect to printer webcam at {webcam_url}: {e}")
+        raise HTTPException(status_code=502, detail="Printer webcam stream is currently unavailable.")
+
+# --- FILE DOWNLOAD PROXY ENDPOINT ---
+@app.get("/download")
+async def download_proxy(request: Request):
+    if not PRINTER_IP:
+        raise HTTPException(status_code=400, detail="No printer selected/connected")
+    
+    # Forward the exact query string (X-Token and file_name) to the printer
+    query_string = request.url.query
+    printer_url = f"http://{PRINTER_IP}/download?{query_string}"
+    logger.info(f"[Download Proxy] Proxying file download from printer: {printer_url}")
+    
+    try:
+        req = urllib.request.Request(printer_url)
+        response = urllib.request.urlopen(req, timeout=15)
+        
+        # Extract headers from the printer response
+        headers = {
+            "Content-Disposition": response.headers.get("Content-Disposition", "attachment"),
+            "Content-Type": response.headers.get("Content-Type", "application/octet-stream")
+        }
+        
+        def stream_file():
+            try:
+                while True:
+                    chunk = response.read(128 * 1024)  # Read in 128KB chunks
+                    if not chunk:
+                        break
+                    yield chunk
+            except Exception as e:
+                logger.error(f"[Download Proxy] Error during file stream: {e}")
+            finally:
+                response.close()
+                
+        return StreamingResponse(stream_file(), headers=headers)
+    except Exception as e:
+        logger.error(f"[Download Proxy] Failed to proxy file download from tiskarna: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch file from printer")
+
+# --- LIVE STATE WEBSOCKET PROXY BRIDGE (Port 9001 -> Port 8484) ---
+@app.websocket("/ws-mqtt")
+async def websocket_mqtt_proxy(client_ws: WebSocket):
+    requested_protocols = client_ws.headers.get("sec-websocket-protocol", "")
+    subprotocol = "mqtt" if "mqtt" in requested_protocols else None
+    
+    await client_ws.accept(subprotocol=subprotocol)
+    
+    if not PRINTER_IP:
+        logger.warning("[WS Proxy] Attempted connection with no active printer selected.")
+        await client_ws.close()
+        return
+        
+    printer_ws_url = f"ws://{PRINTER_IP}:9001/"
+    logger.info(f"[WS Proxy] Establishing live tunnel from client to printer WS at {printer_ws_url} (Subprotocol: {subprotocol})...")
+    
+    loop = asyncio.get_running_loop()
+    
+    try:
+        # Increase the connection socket timeout to 10 seconds to detect dead servers
+        printer_ws = await loop.run_in_executor(
+            None,
+            lambda: ws_client_lib.create_connection(
+                printer_ws_url, 
+                timeout=10, 
+                subprotocols=["mqtt"] if subprotocol else None
+            )
+        )
+    except Exception as e:
+        logger.error(f"[WS Proxy] Connection to printer WebSocket failed: {e}")
+        await client_ws.close()
+        return
+
+    # Thread target to safely pull messages from the printer and pipe them back to the client WS
+    def receive_from_printer():
+        import socket  # Import socket inside thread to capture raw socket exceptions
+        try:
+            while True:
+                try:
+                    data = printer_ws.recv()
+                    if not data:
+                        break
+                except (ws_client_lib.WebSocketTimeoutException, socket.timeout):
+                    # Safely ignore silence timeouts and loop again to keep the tunnel alive
+                    continue
+                
+                # Securely dispatch the transmission to the active async loop
+                if isinstance(data, str):
+                    asyncio.run_coroutine_threadsafe(client_ws.send_text(data), loop)
+                else:
+                    asyncio.run_coroutine_threadsafe(client_ws.send_bytes(data), loop)
+        except Exception as e:
+            logger.debug(f"[WS Proxy] Printer stream connection closed: {e}")
+        finally:
+            # Safely shut down the client WS once the printer connection drops
+            asyncio.run_coroutine_threadsafe(client_ws.close(), loop)
+
+    # Spawn daemon thread for printer-to-client pipeline
+    threading.Thread(target=receive_from_printer, daemon=True).start()
+
+    # Main async loop to receive transmissions from client and pipe them directly to the printer
+    try:
+        while True:
+            data = await client_ws.receive()
+            if "text" in data:
+                printer_ws.send(data["text"])
+            elif "bytes" in data:
+                printer_ws.send(data["bytes"])
+    except WebSocketDisconnect:
+        logger.info("[WS Proxy] Client closed WebSocket connection.")
+    except Exception as e:
+        logger.error(f"[WS Proxy] Error inside communication loop: {e}")
+    finally:
+        try:
+            printer_ws.close()
+            logger.info("[WS Proxy] Closed connection to printer.")
+        except Exception:
+            pass
+
+# --- SPA ROUTING WITH "BACK TO HUB", WEBCAM, WEBSOCKET, AND DOWNLOAD PATCHERS INJECTION ---
 @app.get("/index")
 @app.get("/index.html")
-async def serve_index_page(request: Request):
-    logger.info("[Server] Received printer web panel request. Serving index.html with injected Back button...")
+async def serve_index_page():
+    logger.info("[Server] Received printer web panel request. Serving index.html with injected Back button and Network patches...")
     index_path = "lan_service_web/index.html"
     
     if os.path.exists(index_path):
@@ -809,10 +928,84 @@ async def serve_index_page(request: Request):
             with open(index_path, "r", encoding="utf-8") as f:
                 html_content = f.read()
             
-            # Absolute floating "Back to Hub" button HTML designed to match Elegoo's dark teal UI
+            # JAVASCRIPT NETWORK PATCHERS
+            # 1. Webcam interceptor (redirects 8080 stream to /webcam)
+            # 2. WebSocket interceptor (redirects direct ws://...:9001 to /ws-mqtt on this server)
+            # 3. Downloads interceptor (redirects direct http://.../download to /download on this server)
+            proxy_injection_script = """
+            <!-- NETWORK BYPASS PROXY INTERCEPTORS (WEBCAM, WEBSOCKET & DOWNLOADS) -->
+            <script>
+            (function() {
+                console.log("[Network Proxy] Injecting interceptors...");
+                
+                // --- 1. WEBCAM INTERCEPTOR ---
+                const imgDescriptor = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+                const originalImgSet = imgDescriptor.set;
+                
+                Object.defineProperty(HTMLImageElement.prototype, 'src', {
+                    set: function(value) {
+                        if (typeof value === 'string' && (value.includes(':8080/?action=stream') || value.includes('/?action=stream'))) {
+                            console.log("[Webcam Proxy] Redirecting direct port 8080 stream to local proxy:", value);
+                            value = '/webcam';
+                        }
+                        originalImgSet.call(this, value);
+                    }
+                });
+                
+                // --- 2. WEBSOCKET INTERCEPTOR ---
+                const OriginalWebSocket = window.WebSocket;
+                window.WebSocket = function(url, protocols) {
+                    if (typeof url === 'string' && url.includes(':9001')) {
+                        console.log("[WS Proxy] Redirecting direct port 9001 WebSocket to local bridge:", url);
+                        const localProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                        url = localProto + '//' + window.location.host + '/ws-mqtt';
+                    }
+                    return new OriginalWebSocket(url, protocols);
+                };
+                
+                window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
+                window.WebSocket.OPEN = OriginalWebSocket.OPEN;
+                window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
+                window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
+                window.WebSocket.prototype = OriginalWebSocket.prototype;
+
+                // --- 3. DOWNLOADS INTERCEPTOR ---
+                // Intercept window.open downloads
+                const originalOpen = window.open;
+                window.open = function(url, target, features) {
+                    if (typeof url === 'string' && url.includes('/download')) {
+                        console.log("[Download Proxy] Intercepting window.open download:", url);
+                        try {
+                            const urlObj = new URL(url, window.location.href);
+                            url = '/download' + urlObj.search;
+                        } catch(e) {}
+                    }
+                    return originalOpen.call(window, url, target, features);
+                };
+                
+                // Intercept standard <a> tag download clicks
+                document.addEventListener('click', function(e) {
+                    let target = e.target;
+                    while (target && target.tagName !== 'A') {
+                        target = target.parentNode;
+                    }
+                    if (target && target.href && target.href.includes('/download')) {
+                        console.log("[Download Proxy] Intercepting link click download:", target.href);
+                        try {
+                            const urlObj = new URL(target.href, window.location.href);
+                            target.href = '/download' + urlObj.search;
+                        } catch(e) {}
+                    }
+                }, true);
+            })();
+            </script>
+            """
+            
+            # FLOATING BACK TO WEB HUB BUTTON
+            # Positioned on the left side of the screen
             back_button_html = """
             <!-- FLOATING BACK TO WEB HUB BUTTON -->
-            <div id="oe-back-button" style="position: fixed; bottom: 20px; right: 20px; z-index: 999999; font-family: sans-serif;">
+            <div id="oe-back-button" style="position: fixed; bottom: 20px; left: 20px; z-index: 999999; font-family: sans-serif;">
                 <a href="/" style="display: flex; align-items: center; justify-content: center; gap: 8px; background-color: #0d9488; color: white; text-decoration: none; padding: 10px 16px; border-radius: 50px; font-weight: bold; font-size: 14px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); border: 1px solid #2dd4bf; transition: all 0.2s ease-in-out;" 
                    onmouseover="this.style.backgroundColor='#0f766e'; this.style.transform='scale(1.05)';" 
                    onmouseout="this.style.backgroundColor='#0d9488'; this.style.transform='scale(1)';">
@@ -825,6 +1018,13 @@ async def serve_index_page(request: Request):
             </div>
             """
             
+            # Inject Patches into <head>
+            if "<head>" in html_content:
+                html_content = html_content.replace("<head>", f"<head>{proxy_injection_script}")
+            else:
+                html_content = proxy_injection_script + html_content
+                
+            # Inject Back Button HTML right before </body>
             if "</body>" in html_content:
                 html_content = html_content.replace("</body>", f"{back_button_html}</body>")
             else:
@@ -852,6 +1052,6 @@ if __name__ == "__main__":
     # Start heartbeat ping task in a background daemon thread
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     
-    # Spin up web server on port 8484
+    # Spin up web server on localhost (127.0.0.1)
     logger.info("Launching Uvicorn server on port 8484.")
     uvicorn.run(app, host="0.0.0.0", port=8484, log_level="info")
