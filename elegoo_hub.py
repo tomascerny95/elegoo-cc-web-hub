@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ElegooHub")
 
-# --- NÁZEV KONFIGURAČNÍHO SOUBORU ---
+# --- CONFIG FILE NAME ---
 CONFIG_FILE = "config.json"
 
 # --- GLOBAL CONFIGURATION (In-Memory Only, No Config File on Disk) ---
@@ -51,7 +51,7 @@ mqtt_client = None
 ws_client = None
 ws_client_conn = None  # Holds the active websocket connection instance for CC1
 
-# --- HLAVNÍ FUNKCE PRO PRÁCI S KONFIGURAČNÍM SOUBOREM ---
+# --- CORE CONFIGURATION FILE FUNCTIONS ---
 def load_config():
     global PRINTER_IP, PRINTER_SN, PRINTER_PROTO
     if os.path.exists(CONFIG_FILE):
@@ -61,9 +61,9 @@ def load_config():
                 PRINTER_IP = data.get("ip", "")
                 PRINTER_SN = data.get("sn", "")
                 PRINTER_PROTO = data.get("proto", "")
-                logger.info(f"[Config] Načtena konfigurace: IP={PRINTER_IP} | SN={PRINTER_SN} | Protokol={PRINTER_PROTO}")
+                logger.info(f"[Config] Configuration loaded: IP={PRINTER_IP} | SN={PRINTER_SN} | Protocol={PRINTER_PROTO}")
         except Exception as e:
-            logger.error(f"[Config] Chyba načítání: {e}", exc_info=True)
+            logger.error(f"[Config] Error loading config: {e}", exc_info=True)
 
 def save_config(ip, sn, proto):
     try:
@@ -74,13 +74,13 @@ def save_config(ip, sn, proto):
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config_data, f, indent=4, ensure_ascii=False)
-        logger.info(f"[Config] Uloženo: IP={ip} | SN={sn} | Protokol={proto}")
+        logger.info(f"[Config] Saved: IP={ip} | SN={sn} | Protocol={proto}")
     except Exception as e:
-        logger.error(f"[Config] Chyba ukládání: {e}", exc_info=True)
+        logger.error(f"[Config] Error saving config: {e}", exc_info=True)
 
-# --- 1. AUTOMATICKÉ VYHLEDÁNÍ VŠECH TISKÁREN (UDP Multiscanning) ---
+# --- 1. AUTOMATIC PRINTER DISCOVERY (UDP Multiscanning) ---
 def discover_multiple_printers(timeout_sec=2.0):
-    logger.info("Spouštím UDP vyhledávání všech tiskáren CC v síti...")
+    logger.info("Starting UDP search for all CC printers on the network...")
     discovered = []
     
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -101,7 +101,7 @@ def discover_multiple_printers(timeout_sec=2.0):
                 model = result.get('machine_model', 'Unknown')
                 hostname = result.get('host_name', '') 
                 
-                # Určíme protokol podle názvu modelu tiskárny
+                # Determine protocol based on printer model name
                 proto = "cc2" if "2" in str(model) else "cc1"
                 
                 if not any(p['ip'] == ip for p in discovered) and sn:
@@ -112,21 +112,15 @@ def discover_multiple_printers(timeout_sec=2.0):
                         "hostname": hostname,
                         "proto": proto
                     })
-                    logger.info(f"[Discovery] Nalezena tiskárna: {model} ({hostname}) na IP {ip} (Protokol: {proto})")
+                    logger.info(f"[Discovery] Printer found: {model} ({hostname}) at IP {ip} (Protocol: {proto})")
             except socket.timeout:
                 continue
             except Exception as e:
-                logger.error(f"[Discovery] Chyba při skenování: {e}")
+                logger.error(f"[Discovery] Error during scanning: {e}")
                 
     return discovered
 
-def discover_printer(timeout_sec=2.0):
-    printers = discover_multiple_printers(timeout_sec)
-    if printers:
-        return printers[0]["ip"], printers[0]["sn"], printers[0]["proto"]
-    return None, None, None
-
-# --- 2. MQTT KOMUNIKACE (Pro tiskárnu CC2) ---
+# --- 2. MQTT COMMUNICATION (For CC2 Printer) ---
 def on_connect_cc2(client, userdata, flags, rc):
     global PRINTER_SN, register_request_id
     if rc == 0:
@@ -196,7 +190,7 @@ def send_raw_command_cc2(method, params=None):
         })
         mqtt_client.publish(req_topic, payload, qos=0)
 
-# --- 3. WEBSOCKET KOMUNIKACE (Pro tiskárnu CC1) ---
+# --- 3. WEBSOCKET COMMUNICATION (For CC1 Printer) ---
 def on_ws_open(ws):
     global ws_client_conn, printer_state
     logger.info(f"[WS CC1] Connected to CC1 printer ({PRINTER_IP}). Initializing connection...")
@@ -281,7 +275,7 @@ def start_ws_cc1_thread():
     )
     ws_client.run_forever()
 
-# --- SPOLEČNÝ SYSTÉM PŘIPOJENÍ ---
+# --- SHARED CONNECTION INTERFACE ---
 def connect_to_printer(ip, sn, proto):
     global mqtt_client, ws_client, ws_client_conn, PRINTER_IP, PRINTER_SN, PRINTER_PROTO, printer_state
     
@@ -290,7 +284,7 @@ def connect_to_printer(ip, sn, proto):
     PRINTER_SN = sn
     PRINTER_PROTO = proto
     
-    # 1. Zastavíme předchozího MQTT klienta (CC2)
+    # 1. Stop the previous MQTT client (CC2)
     if mqtt_client:
         logger.info("Disconnecting old MQTT client (CC2)...")
         try:
@@ -298,9 +292,9 @@ def connect_to_printer(ip, sn, proto):
             mqtt_client.disconnect()
             mqtt_client = None
         except Exception as e:
-            logger.error(f"Chyba při odpojování MQTT: {e}")
+            logger.error(f"Error disconnecting MQTT: {e}")
             
-    # 2. Zastavíme předchozího WebSocket klienta (CC1)
+    # 2. Stop the previous WebSocket client (CC1)
     if ws_client:
         logger.info("Disconnecting old WebSocket client (CC1)...")
         try:
@@ -308,14 +302,14 @@ def connect_to_printer(ip, sn, proto):
             ws_client = None
             ws_client_conn = None
         except Exception as e:
-            logger.error(f"Chyba při odpojování WebSocketu: {e}")
+            logger.error(f"Error disconnecting WebSocket: {e}")
 
-    # Resetujeme stavy
+    # Reset printer state
     printer_state["connected"] = False
     printer_state["registered"] = False
     printer_state["status"] = "Connecting..."
 
-    # 3. Spustíme klienta podle vybraného protokolu tiskárny
+    # 3. Start client based on selected printer protocol
     if proto == "cc2":
         mqtt_client = mqtt.Client(client_id=client_id)
         mqtt_client.username_pw_set("elegoo", "")
@@ -343,7 +337,7 @@ def heartbeat_loop():
                 logger.error(f"Error in PING: {e}")
         time.sleep(10)
 
-# --- 3. WEBOVÝ SERVER (FastAPI) ---
+# --- 4. WEB SERVER (FastAPI) ---
 app = FastAPI()
 
 @app.middleware("http")
@@ -351,12 +345,12 @@ async def log_requests(request: Request, call_next):
     logger.debug(f"[HTTP] {request.method} {request.url.path}")
     return await call_next(request)
 
-# --- HLAVNÍ WEB HUB (Rozcestník) ---
+# --- MAIN WEB HUB (Landing Page) ---
 @app.get("/", response_class=HTMLResponse)
 async def get_hub():
     html_content = """
     <!DOCTYPE html>
-    <html lang="cs">
+    <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -477,7 +471,6 @@ async def get_hub():
                 font-size: 0.875rem;
                 margin: 0;
             }
-            /* Styly pro formulář manuálního připojení */
             .text-input {
                 background-color: #030712;
                 color: #f3f4f6;
@@ -545,18 +538,18 @@ async def get_hub():
         <div class="container">
             <header>
                 <h1>Elegoo CC Family Hub</h1>
-                <p class="subtitle">Skenování sítě a výběr tiskárny řady CC1/CC2</p>
+                <p class="subtitle">Network scanning and printer selection for CC1/CC2 series</p>
             </header>
 
-            <!-- Seznam tiskáren -->
+            <!-- Printer List -->
             <div class="card">
                 <div class="card-header">
-                    <h2 style="font-size: 1.125rem; font-weight: bold; color: #d1d5db; margin: 0;">Nalezené tiskárny</h2>
+                    <h2 style="font-size: 1.125rem; font-weight: bold; color: #d1d5db; margin: 0;">Discovered Printers</h2>
                     <button onclick="scanNetwork()" id="scan-btn" class="btn-scan">Scan Network</button>
                 </div>
                 
                 <div id="printer-list">
-                    <p class="placeholder" id="placeholder">Klepněte na "Skenovat síť" pro zahájení vyhledávání.</p>
+                    <p class="placeholder" id="placeholder">Click "Scan Network" to start searching.</p>
                 </div>
             </div>
 
@@ -567,15 +560,19 @@ async def get_hub():
                 </div>
                 
                 <div id="saved-printer-list">
-                    <!-- Saved profiles will render dynamically here -->
                     <p class="placeholder" id="saved-placeholder">No saved printers. Add one using the manual connection form below.</p>
                 </div>
             </div>
 
-            <!-- KARTA MANUÁLNÍHO PŘIPOJENÍ -->
+            <!-- MANUAL CONNECTION CARD -->
             <div class="card">
                 <div class="card-header">
                     <h2 style="font-size: 1.125rem; font-weight: bold; color: #d1d5db; margin: 0;">Manual Connection</h2>
+                </div>
+                
+                <div class="form-group">
+                    <label for="manual-name">Printer Name (Optional)</label>
+                    <input type="text" id="manual-name" placeholder="e.g. My Carbon 2" class="text-input">
                 </div>
                 
                 <div class="form-group">
@@ -606,16 +603,15 @@ async def get_hub():
         </div>
 
         <script>
-            // Browser LocalStorage persistence functions (100% Client-Side, Stateless Backend)
             function getSavedPrinters() {
                 const data = localStorage.getItem('elegoo_saved_printers');
                 return data ? JSON.parse(data) : [];
             }
 
-            function savePrinterToList(ip, sn, proto) {
+            function savePrinterToList(name, ip, sn, proto) {
                 let printers = getSavedPrinters();
                 if (!printers.some(p => p.ip === ip)) {
-                    printers.push({ ip, sn, proto });
+                    printers.push({ name, ip, sn, proto });
                     localStorage.setItem('elegoo_saved_printers', JSON.stringify(printers));
                 }
             }
@@ -642,7 +638,7 @@ async def get_hub():
                     div.className = 'printer-item';
                     div.innerHTML = `
                         <div class="printer-info">
-                            <h3>Elegoo CC (${p.proto.toUpperCase()})</h3>
+                            <h3>${p.name} (${p.proto.toUpperCase()})</h3>
                             <p>IP: ${p.ip} | SN: ${p.sn}</p>
                         </div>
                         <div style="display: flex; gap: 0.5rem;">
@@ -716,6 +712,7 @@ async def get_hub():
                 const ip = document.getElementById('manual-ip').value.trim();
                 const sn = document.getElementById('manual-sn').value.trim().toUpperCase();
                 const proto = document.getElementById('manual-proto').value;
+                const name = document.getElementById('manual-name').value.trim() || 'Elegoo CC';
                 const saveProfile = document.getElementById('save-profile').checked;
 
                 if (!ip || !sn) {
@@ -729,7 +726,7 @@ async def get_hub():
                     
                     if (resData.success) {
                         if (saveProfile) {
-                            savePrinterToList(ip, sn, proto);
+                            savePrinterToList(name, ip, sn, proto);
                         }
                         const targetUrl = `/index?ip=${ip}&sn=${sn}&lang=en_US`;
                         window.location.href = targetUrl;
@@ -800,7 +797,7 @@ async def handle_command(cmd: str):
             
     return {"success": True}
 
-# --- FUNKČNÍ SPA ROUTING S INJEKTÁŽÍ TLAČÍTKA „ZPĚT NA HUB“ ---
+# --- SPA ROUTING WITH "BACK TO HUB" BUTTON INJECTION ---
 @app.get("/index")
 @app.get("/index.html")
 async def serve_index_page(request: Request):
@@ -841,14 +838,14 @@ async def serve_index_page(request: Request):
         logger.error(f"[Server] Slicer webassets index.html file not found in 'lan_service_web' directory!")
         raise HTTPException(status_code=404, detail="index.html not found.")
 
-# --- 4. ZABUDOVÁNÍ OFICIÁLNÍHO WEBU ZE SLICERU ---
+# --- 5. MOUNTING OFFICIAL SLICER WEB PANEL ---
 if os.path.exists("lan_service_web"):
     app.mount("/", StaticFiles(directory="lan_service_web", html=True), name="static")
     logger.info("Official Elegoo Web Assets found.")
 else:
     logger.warning("Folder 'lan_service_web' not found. Please place it in the same directory as this script.")
 
-# --- 5. START PROGRAMU ---
+# --- 6. APPLICATION ENTRY POINT ---
 if __name__ == "__main__":
     logger.info("=== Starting Elegoo Family Controller Server ===")
     
