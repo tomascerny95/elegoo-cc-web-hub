@@ -1,16 +1,19 @@
 # Elegoo CC Web Hub
 
-A lightweight, stateless, and 100% local Web Hub for controlling both **Elegoo Centauri Carbon (CC1)** and **Centauri Carbon 2 (CC2)** 3D printers directly in your web browser. 
+A lightweight, stateless, and local Web Hub for controlling both **Elegoo Centauri Carbon (CC1)** and **Centauri Carbon 2 (CC2)** 3D printers directly in your web browser. 
 
 This program automatically discovers your printers on the local network, identifies their connection protocol (WebSocket/SDCP for CC1 or MQTT for CC2), and serves the official Elegoo Slicer web panel in English.
 
 ## Features
 
-- **Dynamic Network Discovery:** Automatically scans your local network on startup to find any active Elegoo CC printers. No manual IP or Serial Number entry required!
+- **Dynamic Network Discovery:** Automatically scans your local network on startup to find active Elegoo CC printers. No manual IP or Serial Number entry required for discovered devices.
 - **Dual-Protocol Support:** Handles both CC1 (SDCP over WebSockets on port 3030) and CC2 (MQTT on port 1883) protocols dynamically.
 - **Unification:** Serves the official Elegoo web-assets in English (`&lang=en_US`) seamlessly.
-- **Floating "Back to Hub" Button:** Injects a custom floating button into the printer interface so you can easily return to the Hub and switch printers.
-- **100% Stateless & Local:** Does not write any configuration files to your disk, making it highly secure and SD-card friendly.
+- **Floating "Back to Hub" Button:** Injects a custom floating button into the printer interface so you can return to the Hub dashboard and switch printers easily.
+- **My Saved Printers (New):** Save your printers directly in your browser using HTML5 LocalStorage. This keeps the backend server lightweight and stateless, as your printer profiles are preserved client-side.
+- **Manual Connection Bypass (New):** Manually connect to printers using their IP address and Serial Number. This is useful if UDP broadcast discovery is blocked on your network, or if your printers reside on different subnets or VLANs.
+- **Profile Management (New):** Assign custom names to manual printer setups and delete saved configurations from your list when they are no longer needed.
+- **Enhanced Hostname Recognition (New):** Displays custom printer hostnames alongside their model names in the discovery list for easier identification.
 
 ## Python Installation Guide (For Beginners)
 
@@ -58,7 +61,7 @@ elegoo-cc-web-hub/
     └── (all other folders/assets...)
 ```
 
-> **Note:** To respect copyrights, this repository does not distribute the `lan_service_web` directory. You can easily find and copy this directory from your local Elegoo Slicer or OrcaSlicer installation files (typically under `resources/plugins/elegoolink/web/lan_service_web/`).
+> **Note:** To respect copyrights, this repository does not distribute the `lan_service_web` directory. You can find and copy this directory from your local Elegoo Slicer or OrcaSlicer installation files (typically under `resources/plugins/elegoolink/web/lan_service_web/`).
 
 ## Installation & Running
 
@@ -77,4 +80,6 @@ elegoo-cc-web-hub/
 4. Open your web browser on any device in the same network and navigate to:
    `http://<YOUR_RASPBERRY_PI_IP>:8484`
 
-5. Click **"Scan Network"**, find your printer, and click **"Connect"**!
+5. From the main dashboard:
+   - Click **"Scan Network"** to discover nearby printers, or 
+   - Fill out the **"Manual Connection"** form to connect and save custom profiles directly into your browser's persistent storage.
