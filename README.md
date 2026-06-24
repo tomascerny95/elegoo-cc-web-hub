@@ -19,6 +19,16 @@ This program automatically discovers your printers on the local network, identif
 - **Tailscale & VPN Optimized (New):** Fully tested and optimized for remote networks. Because all assets (web pages, live WebSocket data, webcam video, and file downloads) are tunneled through a single port (8484), you can safely monitor your printer from anywhere using Tailscale, with zero router port-forwarding required.
 - **Floating "Back to Hub" Button:** Injects a custom floating button into the bottom-left corner of the printer interface so you can return to the Hub dashboard and switch printers easily.
 
+
+## Installation via Git
+
+To get the latest version of the Elegoo CC Web Hub, clone the repository directly to your Raspberry Pi or computer:
+
+```bash
+git clone https://github.com/tomascerny95/elegoo-cc-web-hub.git
+cd elegoo-cc-web-hub
+```
+
 ## Python Installation Guide (For Beginners)
 
 Before running this script, you must have Python 3 and `pip` (Python package manager) installed on your system.
@@ -96,3 +106,24 @@ With Tailscale installed on both your Raspberry Pi and your remote device (phone
 `http://<YOUR_TAILSCALE_IP>:8484`
 
 Because of the integrated single-port proxying, the live webcam stream, MQTT real-time printer updates, and video/g-code downloads will work seamlessly over the encrypted Tailscale connection.
+
+
+## Autostart on Raspberry Pi
+
+You can set up the Elegoo CC Web Hub to start automatically on boot using the provided setup script. This script creates a systemd service, enables it, and starts it immediately.
+
+1. Run the setup script:
+   ```bash
+   bash setup_autostart.sh
+   ```
+
+2. The script will automatically:
+   - Detect your current project directory.
+   - Identify the Python 3 path.
+   - Create a service file at `/etc/systemd/system/elegoo_hub.service`.
+   - Reload the systemd daemon and enable the service.
+
+You can check the status of the service at any time using:
+```bash
+sudo systemctl status elegoo_hub.service
+```
