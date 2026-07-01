@@ -4,6 +4,8 @@ A lightweight, stateless, and local Web Hub for controlling both **Elegoo Centau
 
 This program automatically discovers your printers on the local network, identifies their connection protocol, and serves the official Elegoo Slicer web panel in English.
 
+<img width="551" height="859" alt="image" src="https://github.com/user-attachments/assets/440027a5-fab1-4d1b-8b91-a101992c2d24" />
+
 ## Features
 
 - **Dynamic Network Discovery:** Automatically scans your local network on startup to find active Elegoo CC printers. No manual IP or Serial Number entry required for discovered devices.
