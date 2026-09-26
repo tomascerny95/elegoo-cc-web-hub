@@ -8,6 +8,8 @@ import logging
 import string
 import urllib.request
 import urllib.parse
+import http.client
+import hashlib
 import asyncio
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
@@ -45,10 +47,9 @@ printer_state = {
 client_id = f"1_PC_{random.randint(1000, 9999)}"
 register_request_id = f"{client_id}_req"
 
-# Connection client instances
 mqtt_client = None
 ws_client = None
-ws_client_conn = None  # Holds the active websocket connection instance for CC1
+ws_client_conn = None
 
 # --- 1. AUTOMATIC PRINTER DISCOVERY (UDP Multiscanning) ---
 def discover_multiple_printers(timeout_sec=2.0):
@@ -72,8 +73,6 @@ def discover_multiple_printers(timeout_sec=2.0):
                 sn = result.get('sn')
                 model = result.get('machine_model', 'Unknown')
                 hostname = result.get('host_name', '') 
-                
-                # Determine protocol based on printer model name
                 proto = "cc2" if "2" in str(model) else "cc1"
                 
                 if not any(p['ip'] == ip for p in discovered) and sn:
@@ -256,9 +255,7 @@ def connect_to_printer(ip, sn, proto):
     PRINTER_SN = sn
     PRINTER_PROTO = proto
     
-    # 1. Stop the previous MQTT client (CC2)
     if mqtt_client:
-        logger.info("Disconnecting old MQTT client (CC2)...")
         try:
             mqtt_client.loop_stop()
             mqtt_client.disconnect()
@@ -266,9 +263,7 @@ def connect_to_printer(ip, sn, proto):
         except Exception as e:
             logger.error(f"Error disconnecting MQTT: {e}")
             
-    # 2. Stop the previous WebSocket client (CC1)
     if ws_client:
-        logger.info("Disconnecting old WebSocket client (CC1)...")
         try:
             ws_client.close()
             ws_client = None
@@ -276,14 +271,15 @@ def connect_to_printer(ip, sn, proto):
         except Exception as e:
             logger.error(f"Error disconnecting WebSocket: {e}")
 
-    # Reset printer state
     printer_state["connected"] = False
     printer_state["registered"] = False
     printer_state["status"] = "Connecting..."
 
-    # 3. Start client based on selected printer protocol
     if proto == "cc2":
-        mqtt_client = mqtt.Client(client_id=client_id)
+        try:
+            mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=client_id)
+        except Exception:
+            mqtt_client = mqtt.Client(client_id=client_id)
         mqtt_client.username_pw_set("elegoo", "")
         mqtt_client.on_connect = on_connect_cc2
         mqtt_client.on_message = on_message_cc2
@@ -312,7 +308,6 @@ def heartbeat_loop():
 # --- 4. WEB SERVER (FastAPI) ---
 app = FastAPI()
 
-# --- MAIN WEB HUB (Landing Page) ---
 @app.get("/", response_class=HTMLResponse)
 async def get_hub():
     html_content = """
@@ -508,7 +503,6 @@ async def get_hub():
                 <p class="subtitle">Network scanning and printer selection for CC1/CC2 series</p>
             </header>
 
-            <!-- Printer List -->
             <div class="card">
                 <div class="card-header">
                     <h2 style="font-size: 1.125rem; font-weight: bold; color: #d1d5db; margin: 0;">Discovered Printers</h2>
@@ -520,7 +514,6 @@ async def get_hub():
                 </div>
             </div>
 
-            <!-- Saved Printers Profile List -->
             <div class="card">
                 <div class="card-header">
                     <h2 style="font-size: 1.125rem; font-weight: bold; color: #d1d5db; margin: 0;">My Saved Printers</h2>
@@ -531,7 +524,6 @@ async def get_hub():
                 </div>
             </div>
 
-            <!-- MANUAL CONNECTION CARD -->
             <div class="card">
                 <div class="card-header">
                     <h2 style="font-size: 1.125rem; font-weight: bold; color: #d1d5db; margin: 0;">Manual Connection</h2>
@@ -717,8 +709,7 @@ async def get_hub():
 
 @app.get("/api/discover")
 async def api_discover():
-    printers = discover_multiple_printers(timeout_sec=2.0)
-    return printers
+    return discover_multiple_printers(timeout_sec=2.0)
 
 @app.post("/api/connect")
 async def api_connect(ip: str, sn: str, proto: str):
@@ -835,33 +826,116 @@ async def download_proxy(request: Request):
         logger.error(f"[Download Proxy] Failed to proxy file download from tiskarna: {e}")
         raise HTTPException(status_code=502, detail="Failed to fetch file from printer")
 
-# --- FILE UPLOAD PROXY ENDPOINT (Fix for Tailscale G-Code uploads) ---
-@app.post("/upload")
+# --- FILE UPLOAD PROXY ENDPOINT (Fix: Sending Exact Chunk MD5) ---
+@app.api_route("/upload", methods=["POST", "PUT", "OPTIONS"])
 async def upload_proxy(request: Request):
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, PUT, GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Max-Age": "86400"
+            }
+        )
+
     if not PRINTER_IP:
         raise HTTPException(status_code=400, detail="No printer selected/connected")
     
     query_string = request.url.query
-    printer_upload_url = f"http://{PRINTER_IP}/upload"
-    if query_string:
-        printer_upload_url += f"?{query_string}"
-        
-    logger.info(f"[Upload Proxy] Forwarding gcode upload to printer: {printer_upload_url}")
+    path = f"/upload?{query_string}" if query_string else "/upload"
     
-    try:
-        body = await request.body()
-        headers = {}
-        if "content-type" in request.headers:
-            headers["Content-Type"] = request.headers["content-type"]
+    body = await request.body()
+    chunk_len = len(body)
+    chunk_md5 = hashlib.md5(body).hexdigest()
+    range_header = request.headers.get("content-range", "whole-file")
+    
+    # Sestavení hlaviček přesně pro libhv na tiskárně
+    headers_to_send = {}
+    for k, v in request.headers.items():
+        lk = k.lower()
+        if lk == "x-file-name":
+            headers_to_send["X-File-Name"] = v
+        elif lk == "x-token":
+            headers_to_send["X-Token"] = v
+        elif lk == "content-range":
+            headers_to_send["Content-Range"] = v
+        elif lk == "content-type":
+            headers_to_send["Content-Type"] = v
+        elif lk not in {"host", "content-length", "connection", "accept-encoding", "x-file-md5"}:
+            headers_to_send[k] = v
+
+    if "X-Token" not in headers_to_send:
+        headers_to_send["X-Token"] = "123456"
+
+    headers_to_send["Content-Length"] = str(chunk_len)
+    
+    # KLÍČOVÁ OPRAVA: Tiskárna vyžaduje MD5 tohoto konkrétního chunku!
+    headers_to_send["X-File-Md5"] = chunk_md5
+
+    logger.info("=" * 60)
+    logger.info(f"[Upload Proxy] Forwarding chunk ({range_header}) | Size: {chunk_len} B | Chunk MD5: {chunk_md5}")
+
+    loop = asyncio.get_running_loop()
+    
+    def sync_upload():
+        host = PRINTER_IP
+        port = 80
+        if ":" in PRINTER_IP:
+            parts = PRINTER_IP.split(":")
+            host = parts[0]
+            port = int(parts[1])
             
-        req = urllib.request.Request(printer_upload_url, data=body, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            content = resp.read()
-            resp_content_type = resp.headers.get("Content-Type", "application/json")
-            return Response(content=content, status_code=resp.status, media_type=resp_content_type)
+        conn = http.client.HTTPConnection(host, port, timeout=120)
+        try:
+            conn.request(request.method, path, body=body, headers=headers_to_send)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            resp_headers = dict(resp.getheaders())
+            return resp_body, resp.status, resp_headers
+        finally:
+            conn.close()
+
+    try:
+        resp_body, resp_status, resp_headers = await loop.run_in_executor(None, sync_upload)
+        decoded_resp = resp_body.decode('utf-8', errors='ignore').strip()
+        
+        # Záchranná brzda: Pokud by tiskárna přesto vrátila 9004 s očekávaným hashem, automaticky to s ním zopakujeme
+        if resp_status == 200 and '"error_code": 9004' in decoded_resp:
+            try:
+                err_data = json.loads(decoded_resp)
+                wanted_md5 = err_data.get("md5")
+                if wanted_md5:
+                    logger.info(f"  [Auto-Retry] Printer requested MD5: {wanted_md5}. Resending chunk...")
+                    headers_to_send["X-File-Md5"] = wanted_md5
+                    resp_body, resp_status, resp_headers = await loop.run_in_executor(None, sync_upload)
+                    decoded_resp = resp_body.decode('utf-8', errors='ignore').strip()
+            except Exception as ex:
+                logger.warning(f"  [Auto-Retry] Failed: {ex}")
+
+        logger.info(f"[Upload Proxy] Printer responded {resp_status}: {decoded_resp}")
+        logger.info("=" * 60)
+        
+        client_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "*",
+        }
+        for hk, hv in resp_headers.items():
+            if hk.lower() not in {"content-length", "transfer-encoding", "content-encoding"}:
+                client_headers[hk] = hv
+                
+        return Response(
+            content=resp_body,
+            status_code=resp_status,
+            headers=client_headers,
+            media_type=resp_headers.get("Content-Type", "application/json")
+        )
+        
     except Exception as e:
-        logger.error(f"[Upload Proxy] Failed to proxy upload to printer: {e}")
-        raise HTTPException(status_code=502, detail=f"Upload failed: {str(e)}")
+        logger.error(f"[Upload Proxy] Error forwarding upload: {e}")
+        logger.info("=" * 60)
+        raise HTTPException(status_code=502, detail=f"Upload proxy error: {str(e)}")
 
 # --- LIVE STATE WEBSOCKET PROXY BRIDGE (Port 9001 -> Port 8484) ---
 @app.websocket("/ws-mqtt")
@@ -872,12 +946,14 @@ async def websocket_mqtt_proxy(client_ws: WebSocket):
     await client_ws.accept(subprotocol=subprotocol)
     
     if not PRINTER_IP:
-        logger.warning("[WS Proxy] Attempted connection with no active printer selected.")
-        await client_ws.close()
+        try:
+            await client_ws.close()
+        except Exception:
+            pass
         return
         
     printer_ws_url = f"ws://{PRINTER_IP}:9001/"
-    logger.info(f"[WS Proxy] Establishing live tunnel from client to printer WS at {printer_ws_url} (Subprotocol: {subprotocol})...")
+    logger.info(f"[WS Proxy] Establishing live tunnel to printer WS at {printer_ws_url}...")
     
     loop = asyncio.get_running_loop()
     
@@ -892,7 +968,10 @@ async def websocket_mqtt_proxy(client_ws: WebSocket):
         )
     except Exception as e:
         logger.error(f"[WS Proxy] Connection to printer WebSocket failed: {e}")
-        await client_ws.close()
+        try:
+            await client_ws.close()
+        except Exception:
+            pass
         return
 
     def receive_from_printer():
@@ -913,7 +992,10 @@ async def websocket_mqtt_proxy(client_ws: WebSocket):
         except Exception as e:
             logger.debug(f"[WS Proxy] Printer stream connection closed: {e}")
         finally:
-            asyncio.run_coroutine_threadsafe(client_ws.close(), loop)
+            try:
+                asyncio.run_coroutine_threadsafe(client_ws.close(), loop)
+            except Exception:
+                pass
 
     threading.Thread(target=receive_from_printer, daemon=True).start()
 
@@ -935,7 +1017,7 @@ async def websocket_mqtt_proxy(client_ws: WebSocket):
         except Exception:
             pass
 
-# --- SPA ROUTING WITH "BACK TO HUB", WEBCAM, WEBSOCKET, DOWNLOAD AND UPLOAD PATCHERS ---
+# --- SPA ROUTING WITH INJECTED PATCHES ---
 @app.get("/index")
 @app.get("/index.html")
 async def serve_index_page():
@@ -960,7 +1042,6 @@ async def serve_index_page():
                 Object.defineProperty(HTMLImageElement.prototype, 'src', {
                     set: function(value) {
                         if (typeof value === 'string' && (value.includes(':8080/?action=stream') || value.includes('/?action=stream'))) {
-                            console.log("[Webcam Proxy] Redirecting direct port 8080 stream to local proxy:", value);
                             value = '/webcam';
                         }
                         originalImgSet.call(this, value);
@@ -971,7 +1052,6 @@ async def serve_index_page():
                 const OriginalWebSocket = window.WebSocket;
                 window.WebSocket = function(url, protocols) {
                     if (typeof url === 'string' && url.includes(':9001')) {
-                        console.log("[WS Proxy] Redirecting direct port 9001 WebSocket to local bridge:", url);
                         const localProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                         url = localProto + '//' + window.location.host + '/ws-mqtt';
                     }
@@ -988,7 +1068,6 @@ async def serve_index_page():
                 const originalOpen = window.open;
                 window.open = function(url, target, features) {
                     if (typeof url === 'string' && url.includes('/download')) {
-                        console.log("[Download Proxy] Intercepting window.open download:", url);
                         try {
                             const urlObj = new URL(url, window.location.href);
                             url = '/download' + urlObj.search;
@@ -1003,7 +1082,6 @@ async def serve_index_page():
                         target = target.parentNode;
                     }
                     if (target && target.href && target.href.includes('/download')) {
-                        console.log("[Download Proxy] Intercepting link click download:", target.href);
                         try {
                             const urlObj = new URL(target.href, window.location.href);
                             target.href = '/download' + urlObj.search;
@@ -1011,11 +1089,11 @@ async def serve_index_page():
                     }
                 }, true);
 
-                // --- 4. UPLOADS INTERCEPTOR (XHR & Fetch) ---
+                // --- 4. UPLOADS INTERCEPTOR (ZACHYTÍ XHR & FETCH PUT/POST NA /upload) ---
                 const originalXhrOpen = XMLHttpRequest.prototype.open;
                 XMLHttpRequest.prototype.open = function(method, url, ...rest) {
                     if (typeof url === 'string' && url.includes('/upload')) {
-                        console.log("[Upload Proxy] Intercepting XHR upload request:", url);
+                        console.log("[Upload Proxy] Intercepting XHR " + method + " to:", url);
                         try {
                             const urlObj = new URL(url, window.location.href);
                             url = '/upload' + urlObj.search;
@@ -1029,7 +1107,7 @@ async def serve_index_page():
                 const originalFetch = window.fetch;
                 window.fetch = function(resource, init) {
                     if (typeof resource === 'string' && resource.includes('/upload')) {
-                        console.log("[Upload Proxy] Intercepting Fetch upload request:", resource);
+                        console.log("[Upload Proxy] Intercepting Fetch to:", resource);
                         try {
                             const urlObj = new URL(resource, window.location.href);
                             resource = '/upload' + urlObj.search;
@@ -1044,7 +1122,7 @@ async def serve_index_page():
             """
             
             back_button_html = """
-            <!-- FLOATING BACK TO WEB HUB BUTTON -->
+            <!-- FLOATING BACK TO HUB BUTTON -->
             <div id="oe-back-button" style="position: fixed; bottom: 20px; left: 20px; z-index: 999999; font-family: sans-serif;">
                 <a href="/" style="display: flex; align-items: center; justify-content: center; gap: 8px; background-color: #0d9488; color: white; text-decoration: none; padding: 10px 16px; border-radius: 50px; font-weight: bold; font-size: 14px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); border: 1px solid #2dd4bf; transition: all 0.2s ease-in-out;" 
                    onmouseover="this.style.backgroundColor='#0f766e'; this.style.transform='scale(1.05)';" 
@@ -1086,8 +1164,6 @@ else:
 # --- 6. APPLICATION ENTRY POINT ---
 if __name__ == "__main__":
     logger.info("=== Starting Elegoo Family Controller Server ===")
-    
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-    
     logger.info("Launching Uvicorn server on port 8484.")
-    uvicorn.run(app, host="0.0.0.0", port=8484, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8484, log_level="info", timeout_keep_alive=60)
